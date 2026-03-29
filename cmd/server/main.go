@@ -41,6 +41,17 @@ func main() {
 	}
 	defer log.Sync() //nolint:errcheck
 
+	// ── [MEDIUM] Security warnings at startup ─────────────────────────
+	if cfg.MetricsAuthToken == "" {
+		log.Warn("METRICS_AUTH_TOKEN is not set — /metrics endpoint is publicly accessible on port " + cfg.MetricsPort)
+	}
+	if strings.HasPrefix(cfg.RedisURL, "redis://") {
+		log.Warn("Redis is using a plaintext connection (redis://) — set REDIS_REQUIRE_TLS=true and use rediss:// in production")
+	}
+	if !cfg.GRPCTLSEnabled && cfg.GRPCServiceURL != "" {
+		log.Warn("GRPC_TLS_ENABLED=false — gRPC traffic to downstream service is unencrypted")
+	}
+
 	// ── Redis ─────────────────────────────────────────────────────────
 	redisOpts, err := redis.ParseURL(cfg.RedisURL)
 	if err != nil {
@@ -69,8 +80,6 @@ func main() {
 	}
 
 	// ── Kafka producer ────────────────────────────────────────────────
-	// Kafka is initialised here and injected into any handler that needs to
-	// publish domain events. Wire it into router.Register when a handler needs it.
 	if len(cfg.KafkaBrokers) > 0 {
 		producer, err := queue.NewProducer(cfg, log)
 		if err != nil {
@@ -103,19 +112,31 @@ func main() {
 		},
 	})
 
-	// ── Global middleware (order matters) ─────────────────────────────
+	// ── Global middleware (execution order is critical) ───────────────
 	app.Use(recover.New(recover.Config{EnableStackTrace: enableStackTrace}))
 	app.Use(middleware.RequestID())
+
+	// [MEDIUM] IP blocklist — runs before everything else so blocked IPs
+	// are rejected immediately without executing any other middleware.
+	app.Use(middleware.IPBlocklist(cacheClient, cfg.IPBlocklistEnabled))
+
 	app.Use(middleware.Security(cfg))
 	app.Use(middleware.CORS(cfg))
 	app.Use(middleware.LoadShedding(cfg))
 	app.Use(middleware.Timeout(cfg))
+
+	// [HIGH] Rate limiter is now GLOBAL — runs before Auth so unauthenticated
+	// requests (e.g. bad tokens, brute-force probes) are also throttled.
+	// The rate limiter gracefully handles both anonymous (per-IP only) and
+	// authenticated (per-IP + per-user) requests.
+	app.Use(middleware.RateLimiter(cfg, cacheClient.RDB()))
+
 	app.Use(middleware.Logging(log))
 
 	// ── Routes ────────────────────────────────────────────────────────
 	router.Register(app, cfg, cacheClient, grpcClient)
 
-	// ── Prometheus metrics server (separate port) ─────────────────────
+	// ── Prometheus metrics server ─────────────────────────────────────
 	metricsServer := &http.Server{
 		Addr:    ":" + cfg.MetricsPort,
 		Handler: metricsHandler(cfg),
@@ -137,24 +158,24 @@ func main() {
 	go func() {
 		<-quit
 		log.Info("shutdown signal received")
-
 		if err := app.ShutdownWithTimeout(cfg.GracefulShutdownTimeout); err != nil {
 			log.Error("fiber shutdown error", zap.Error(err))
 		}
-
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.GracefulShutdownTimeout)
 		defer cancel()
 		if err := metricsServer.Shutdown(ctx); err != nil {
 			log.Error("metrics server shutdown error", zap.Error(err))
 		}
-
 		log.Info("gateway stopped cleanly")
 	}()
 
-	// ── Start ─────────────────────────────────────────────────────────
 	log.Info("gateway starting",
 		zap.String("port", cfg.ServerPort),
 		zap.String("log_level", cfg.LogLevel),
+		zap.String("jwt_algorithm", cfg.JWTAlgorithm),
+		zap.Bool("grpc_tls", cfg.GRPCTLSEnabled),
+		zap.Bool("kafka_tls", cfg.KafkaTLSEnabled),
+		zap.Bool("ip_blocklist", cfg.IPBlocklistEnabled),
 	)
 	if err := app.Listen(":" + cfg.ServerPort); err != nil {
 		log.Fatal("gateway listen error", zap.Error(err))

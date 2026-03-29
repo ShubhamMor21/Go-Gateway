@@ -13,7 +13,7 @@ import (
 )
 
 // Config holds every runtime parameter consumed by the gateway.
-// All values originate from environment variables; constants are used as fallbacks only.
+// All values originate from environment variables; constants are fallbacks only.
 type Config struct {
 	// Server
 	ServerPort              string
@@ -23,14 +23,17 @@ type Config struct {
 	WriteTimeout            time.Duration
 	IdleTimeout             time.Duration
 	MaxConcurrency          int
-	MaxRequestSize          int // bytes
+	MaxRequestSize          int
 	GracefulShutdownTimeout time.Duration
 
 	// Auth
-	JWTSecret string
+	JWTSecret      string // required for HS256
+	JWTAlgorithm   string // HS256 (default) | RS256 | ES256
+	JWTPublicKeyPEM string // PEM content, required for RS256 / ES256
 
 	// Redis
-	RedisURL string
+	RedisURL       string
+	RedisRequireTLS bool // if true, startup fails when redis:// (plaintext) is used
 
 	// Kafka
 	KafkaBrokers        []string
@@ -40,19 +43,19 @@ type Config struct {
 	KafkaSASLEnabled    bool
 	KafkaSASLUsername   string
 	KafkaSASLPassword   string
-	KafkaSASLMechanism  string // PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512
+	KafkaSASLMechanism  string
 
 	// gRPC
 	GRPCServiceURL         string
 	GRPCMaxRetries         int
 	GRPCRetryBaseDelay     time.Duration
 	GRPCTLSEnabled         bool
-	GRPCServerNameOverride string // for self-signed certs in staging
+	GRPCServerNameOverride string
 
 	// Rate limiting
 	RateLimitRequests      int
 	RateLimitWindowSeconds int
-	RateLimitFailOpen      bool // false = fail-closed (safer for fintech)
+	RateLimitFailOpen      bool
 
 	// Cache
 	CacheTTL time.Duration
@@ -66,25 +69,23 @@ type Config struct {
 	// Load shedding
 	LoadShedMaxConnections int
 
-	// CORS — required to be set explicitly in production; default "*" is dev-only
+	// CORS
 	CORSAllowedOrigins string
 
 	// Request timeout
 	RequestTimeout time.Duration
 
 	// Metrics
-	MetricsAuthToken string // if set, require Bearer token on /metrics
+	MetricsAuthToken string
+
+	// IP blocklist
+	IPBlocklistEnabled bool
 }
 
-// Load reads .env (if present) then environment variables and returns a validated Config.
-// Missing required secrets cause an immediate fatal-level error — the gateway must not start
-// without them.
 func Load() (*Config, error) {
-	// .env is optional; in production, variables are injected by the orchestrator.
 	_ = godotenv.Load()
 
 	cfg := &Config{
-		// Server
 		ServerPort:              envString("SERVER_PORT", constants.DefaultServerPort),
 		MetricsPort:             envString("METRICS_PORT", constants.DefaultMetricsPort),
 		LogLevel:                envString("LOG_LEVEL", constants.DefaultLogLevel),
@@ -95,11 +96,14 @@ func Load() (*Config, error) {
 		MaxRequestSize:          envInt("MAX_REQUEST_SIZE_MB", constants.DefaultMaxRequestSizeMB) * 1024 * 1024,
 		GracefulShutdownTimeout: envDuration("GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS", constants.DefaultGracefulShutdownSeconds),
 
-		// Auth — required
-		JWTSecret: envString("JWT_SECRET", ""),
+		// Auth
+		JWTSecret:      envString("JWT_SECRET", ""),
+		JWTAlgorithm:   strings.ToUpper(envString("JWT_ALGORITHM", constants.DefaultJWTAlgorithm)),
+		JWTPublicKeyPEM: loadJWTPublicKey(),
 
-		// Redis — required
-		RedisURL: envString("REDIS_URL", ""),
+		// Redis
+		RedisURL:        envString("REDIS_URL", ""),
+		RedisRequireTLS: envBool("REDIS_REQUIRE_TLS", false),
 
 		// Kafka
 		KafkaBrokers:        envStringSlice("KAFKA_BROKERS", ","),
@@ -111,7 +115,7 @@ func Load() (*Config, error) {
 		KafkaSASLPassword:   envString("KAFKA_SASL_PASSWORD", ""),
 		KafkaSASLMechanism:  envString("KAFKA_SASL_MECHANISM", constants.DefaultKafkaSASLMechanism),
 
-		// gRPC
+		// gRPC — TLS defaults to TRUE (changed from false)
 		GRPCServiceURL:         envString("GRPC_SERVICE_URL", ""),
 		GRPCMaxRetries:         envInt("GRPC_MAX_RETRIES", constants.DefaultGRPCMaxRetries),
 		GRPCRetryBaseDelay:     envDurationMs("GRPC_RETRY_BASE_DELAY_MS", constants.DefaultGRPCRetryBaseDelayMs),
@@ -143,6 +147,9 @@ func Load() (*Config, error) {
 
 		// Metrics
 		MetricsAuthToken: envString("METRICS_AUTH_TOKEN", ""),
+
+		// IP blocklist
+		IPBlocklistEnabled: envBool("IP_BLOCKLIST_ENABLED", true),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -153,20 +160,38 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) validate() error {
-	if c.JWTSecret == "" {
-		return fmt.Errorf("JWT_SECRET is required")
+	// ── JWT ───────────────────────────────────────────────────────────
+	switch c.JWTAlgorithm {
+	case "HS256":
+		if c.JWTSecret == "" {
+			return fmt.Errorf("JWT_SECRET is required for HS256")
+		}
+		if len(c.JWTSecret) < constants.JWTSecretMinLength {
+			return fmt.Errorf("JWT_SECRET must be at least %d bytes for HS256 security (got %d)",
+				constants.JWTSecretMinLength, len(c.JWTSecret))
+		}
+	case "RS256", "ES256":
+		if c.JWTPublicKeyPEM == "" {
+			return fmt.Errorf("JWT_PUBLIC_KEY or JWT_PUBLIC_KEY_PATH is required for %s algorithm", c.JWTAlgorithm)
+		}
+	default:
+		return fmt.Errorf("JWT_ALGORITHM must be HS256, RS256, or ES256 (got %q)", c.JWTAlgorithm)
 	}
-	if len(c.JWTSecret) < constants.JWTSecretMinLength {
-		return fmt.Errorf("JWT_SECRET must be at least %d bytes for HS256 security", constants.JWTSecretMinLength)
-	}
+
+	// ── Redis ─────────────────────────────────────────────────────────
 	if c.RedisURL == "" {
 		return fmt.Errorf("REDIS_URL is required")
 	}
+	if c.RedisRequireTLS && strings.HasPrefix(c.RedisURL, "redis://") {
+		return fmt.Errorf("REDIS_REQUIRE_TLS=true but REDIS_URL uses plaintext redis:// — use rediss://")
+	}
+
+	// ── Server ────────────────────────────────────────────────────────
 	if !isValidPort(c.ServerPort) {
-		return fmt.Errorf("SERVER_PORT %q is not a valid port number", c.ServerPort)
+		return fmt.Errorf("SERVER_PORT %q is not a valid port", c.ServerPort)
 	}
 	if !isValidPort(c.MetricsPort) {
-		return fmt.Errorf("METRICS_PORT %q is not a valid port number", c.MetricsPort)
+		return fmt.Errorf("METRICS_PORT %q is not a valid port", c.MetricsPort)
 	}
 	if c.RateLimitRequests <= 0 {
 		return fmt.Errorf("RATE_LIMIT_REQUESTS must be > 0")
@@ -174,15 +199,30 @@ func (c *Config) validate() error {
 	if c.RequestTimeout <= 0 {
 		return fmt.Errorf("REQUEST_TIMEOUT_SECONDS must be > 0")
 	}
+
+	// ── Kafka ─────────────────────────────────────────────────────────
 	if c.KafkaSASLEnabled && (c.KafkaSASLUsername == "" || c.KafkaSASLPassword == "") {
 		return fmt.Errorf("KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD are required when KAFKA_SASL_ENABLED=true")
 	}
+
 	return nil
 }
 
 // ──────────────────────────────────────────────
 // helpers
 // ──────────────────────────────────────────────
+
+// loadJWTPublicKey reads PEM content from JWT_PUBLIC_KEY_PATH (file) or
+// JWT_PUBLIC_KEY (env content). Returns empty string if neither is set.
+func loadJWTPublicKey() string {
+	if path := os.Getenv("JWT_PUBLIC_KEY_PATH"); path != "" {
+		content, err := os.ReadFile(path)
+		if err == nil {
+			return string(content)
+		}
+	}
+	return os.Getenv("JWT_PUBLIC_KEY")
+}
 
 func envString(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -222,13 +262,11 @@ func envBool(key string, fallback bool) bool {
 }
 
 func envDuration(key string, fallbackSeconds int) time.Duration {
-	secs := envInt(key, fallbackSeconds)
-	return time.Duration(secs) * time.Second
+	return time.Duration(envInt(key, fallbackSeconds)) * time.Second
 }
 
 func envDurationMs(key string, fallbackMs int) time.Duration {
-	ms := envInt(key, fallbackMs)
-	return time.Duration(ms) * time.Millisecond
+	return time.Duration(envInt(key, fallbackMs)) * time.Millisecond
 }
 
 func envStringSlice(key, sep string) []string {

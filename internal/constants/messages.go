@@ -1,6 +1,6 @@
 package constants
 
-// User-facing and system messages. All log/response messages must reference these — no inline strings.
+// User-facing and system messages. All log/response messages must reference these.
 const (
 	// Auth
 	MsgUnauthorized      = "Unauthorized"
@@ -8,13 +8,18 @@ const (
 	MsgMissingAuthHeader = "Missing authorization header"
 	MsgTokenExpired      = "Token has expired"
 	MsgTokenInvalid      = "Token is invalid"
+	MsgTokenRevoked      = "Token has been revoked"
+
+	// Ownership / RBAC
+	MsgForbiddenRole      = "Insufficient permissions for this operation"
+	MsgForbiddenOwnership = "You are not authorized to access this resource"
 
 	// Request lifecycle
-	MsgRequestReceived  = "Request received"
+	MsgRequestReceived = "Request received"
 	MsgRequestCompleted = "Request completed"
-	MsgBadRequest       = "Bad request"
-	MsgInvalidPayload   = "Invalid request payload"
-	MsgNotFound         = "Not found"
+	MsgBadRequest      = "Bad request"
+	MsgInvalidPayload  = "Invalid request payload"
+	MsgNotFound        = "Not found"
 
 	// Rate limiting / load shedding
 	MsgRateLimitExceeded  = "Rate limit exceeded, please retry after a moment"
@@ -27,10 +32,6 @@ const (
 	MsgCacheHit  = "Cache hit"
 	MsgCacheMiss = "Cache miss"
 
-	// Queue
-	MsgPaymentQueued    = "Payment queued successfully"
-	MsgQueuePublishFail = "Failed to publish message to queue"
-
 	// gRPC
 	MsgGRPCCallFailed = "gRPC call failed"
 	MsgGRPCTimeout    = "gRPC call timed out"
@@ -39,20 +40,25 @@ const (
 	MsgHealthOK       = "Gateway is healthy"
 	MsgHealthDegraded = "Gateway is degraded"
 
-	// Internal errors
-	MsgInternalError = "An internal error occurred"
+	// Internal
+	MsgInternalError  = "An internal error occurred"
 	MsgRequestTimeout = "Request timed out"
 
-	// Idempotency
-	MsgMissingIdempotencyKey  = "Idempotency-Key header is required"
-	MsgInvalidIdempotencyKey  = "Idempotency-Key must be a valid UUID (36 characters)"
+	// IP blocklist
+	MsgIPBlocked = "Access denied"
 
-	// RBAC
-	MsgForbiddenRole = "Insufficient permissions for this operation"
+	// Queue
+	MsgPaymentQueued    = "Event queued successfully"
+	MsgQueuePublishFail = "Failed to publish message to queue"
 
-	// Content-Type
+	// Logout
+	MsgLogoutSuccess = "Logged out successfully"
+
+	// Validation
 	MsgInvalidContentType = "Content-Type must be application/json"
+	MsgInvalidRequestID   = "X-Request-ID must be alphanumeric with hyphens, max 128 characters"
 
-	// Request ID
-	MsgInvalidRequestID = "X-Request-ID must be alphanumeric with hyphens, max 128 characters"
+	// Idempotency
+	MsgMissingIdempotencyKey = "Idempotency-Key header is required"
+	MsgInvalidIdempotencyKey = "Idempotency-Key must be a valid UUID (36 characters)"
 )

@@ -1,48 +1,68 @@
 package middleware
 
 import (
+	"crypto/ecdsa"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gofiber/fiber/v2"
+	"go.uber.org/zap"
 
+	"github.com/ShubhamMor21/go-gateway/internal/cache"
 	"github.com/ShubhamMor21/go-gateway/internal/config"
 	"github.com/ShubhamMor21/go-gateway/internal/constants"
+	"github.com/ShubhamMor21/go-gateway/internal/logger"
 	"github.com/ShubhamMor21/go-gateway/internal/response"
 )
 
-// jwtClaims is the canonical set of claims expected in every access token.
 type jwtClaims struct {
 	UserID string `json:"sub"`
 	Role   string `json:"role"`
 	jwt.RegisteredClaims
 }
 
-// Auth validates the JWT Bearer token and injects user_id + role into Fiber Locals
-// and downstream request headers. The JWT secret comes exclusively from cfg (ENV).
+// Auth validates the JWT Bearer token and injects identity into Fiber Locals and
+// downstream request headers.
 //
-// Security hardening applied:
-//   - Algorithm pinned to HS256 — "none" and RS/ES variants are rejected at parse time
-//     via jwt.WithValidMethods; cannot be downgraded by a crafted token header.
-//   - Expiry is required (jwt.WithExpirationRequired).
-//   - Issued-at is validated to prevent tokens from the future (jwt.WithIssuedAt).
-//   - 5-second clock leeway handles minor clock skew across services.
-func Auth(cfg *config.Config) fiber.Handler {
-	signingKey := []byte(cfg.JWTSecret)
+// Algorithm support (JWT_ALGORITHM env var):
+//   - HS256 (default) — symmetric HMAC. Requires JWT_SECRET ≥ 32 bytes.
+//     Suitable when the gateway is the sole trust boundary.
+//   - RS256            — asymmetric RSA. Requires JWT_PUBLIC_KEY_PATH or JWT_PUBLIC_KEY.
+//     Recommended for distributed systems: downstream services verify with the
+//     public key and NEVER need the private key.
+//   - ES256            — asymmetric ECDSA (smaller key, faster verification than RSA).
+//     Requires JWT_PUBLIC_KEY_PATH or JWT_PUBLIC_KEY.
+//
+// [CRITICAL] Token revocation:
+//   Tokens are revoked by computing SHA-256(raw_token) and checking Redis.
+//   The token hash and expiry are stored in Locals for the logout handler.
+//   On Redis error the check fails-open (logs an error) to avoid taking down
+//   all authenticated traffic when the cache layer degrades.
+func Auth(cfg *config.Config, cacheClient *cache.Client) fiber.Handler {
+	keyFunc, validMethods, initErr := buildKeyFunc(cfg)
+	if initErr != nil {
+		// Panic at startup — misconfigured auth is non-recoverable.
+		panic(fmt.Sprintf("auth middleware: %v", initErr))
+	}
 
 	parserOptions := []jwt.ParserOption{
-		// Pin to HS256 — prevents algorithm confusion attacks (e.g. "none", RSA→HMAC).
-		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Name}),
-		// Reject tokens without an expiry claim entirely.
+		jwt.WithValidMethods(validMethods),
 		jwt.WithExpirationRequired(),
-		// Reject tokens whose iat is in the future (prevents pre-issued abuse).
 		jwt.WithIssuedAt(),
-		// Tolerate up to 5 s of clock skew between services.
 		jwt.WithLeeway(5 * time.Second),
 	}
 
 	return func(c *fiber.Ctx) error {
+		log := logger.FromContext(c.Locals(constants.LocalLogger))
+
 		raw := c.Get(constants.HeaderAuthorization)
 		if raw == "" {
 			return response.Error(c,
@@ -61,32 +81,23 @@ func Auth(cfg *config.Config) fiber.Handler {
 			)
 		}
 
+		tokenStr := parts[1]
 		claims := &jwtClaims{}
-		token, err := jwt.ParseWithClaims(
-			parts[1],
-			claims,
-			func(t *jwt.Token) (interface{}, error) {
-				return signingKey, nil
-			},
-			parserOptions...,
-		)
 
+		token, err := jwt.ParseWithClaims(tokenStr, claims, keyFunc, parserOptions...)
 		if err != nil {
-			// Surface the most actionable error to the client without leaking internals.
-			switch {
-			case isExpiredError(err):
+			if errors.Is(err, jwt.ErrTokenExpired) {
 				return response.Error(c,
 					fiber.StatusUnauthorized,
 					constants.MsgTokenExpired,
 					constants.ErrCodeTokenExpired,
 				)
-			default:
-				return response.Error(c,
-					fiber.StatusUnauthorized,
-					constants.MsgTokenInvalid,
-					constants.ErrCodeTokenInvalid,
-				)
 			}
+			return response.Error(c,
+				fiber.StatusUnauthorized,
+				constants.MsgTokenInvalid,
+				constants.ErrCodeTokenInvalid,
+			)
 		}
 
 		if !token.Valid || claims.UserID == "" {
@@ -97,12 +108,44 @@ func Auth(cfg *config.Config) fiber.Handler {
 			)
 		}
 
-		// Inject into Locals for middleware/handlers in this process.
+		// ── [CRITICAL] Revocation check ───────────────────────────────
+		// Compute a deterministic hash of the raw token string.
+		// This works regardless of whether the issuer includes a jti claim.
+		hash := sha256.Sum256([]byte(tokenStr))
+		tokenHash := hex.EncodeToString(hash[:])
+
+		if cacheClient != nil {
+			revoked, err := cacheClient.IsRevoked(c.UserContext(), tokenHash)
+			if err != nil {
+				// Fail-open on Redis error: log + continue.
+				// Redis being down is already a P1 incident; adding auth failures
+				// on top would make recovery harder.
+				log.Error("revocation check failed — Redis unreachable, failing open",
+					zap.String(constants.LocalRequestID, func() string {
+						s, _ := c.Locals(constants.LocalRequestID).(string)
+						return s
+					}()),
+					zap.Error(err),
+				)
+			} else if revoked {
+				return response.Error(c,
+					fiber.StatusUnauthorized,
+					constants.MsgTokenRevoked,
+					constants.ErrCodeTokenRevoked,
+				)
+			}
+		}
+
+		// ── Inject identity into Locals and downstream headers ────────
 		c.Locals(constants.LocalUserID, claims.UserID)
 		c.Locals(constants.LocalUserRole, claims.Role)
+		c.Locals(constants.LocalTokenHash, tokenHash)
 
-		// Inject into request headers so downstream gRPC/HTTP services can trust identity
-		// without re-validating the token (gateway is the trust boundary).
+		// Store expiry time so the logout handler can compute the correct TTL.
+		if claims.ExpiresAt != nil {
+			c.Locals(constants.LocalTokenExp, claims.ExpiresAt.Time)
+		}
+
 		c.Request().Header.Set(constants.HeaderUserID, claims.UserID)
 		c.Request().Header.Set(constants.HeaderUserRole, claims.Role)
 
@@ -110,15 +153,13 @@ func Auth(cfg *config.Config) fiber.Handler {
 	}
 }
 
-// RequireRole returns a middleware that enforces role-based access control.
-// Must be placed after Auth in the middleware chain.
-// Usage: app.Post("/admin/...", middleware.Auth(cfg), middleware.RequireRole("admin"))
+// RequireRole enforces role-based access control. Must follow Auth in the chain.
+// Usage: api.Get("/admin/...", middleware.RequireRole("admin"))
 func RequireRole(roles ...string) fiber.Handler {
 	allowed := make(map[string]struct{}, len(roles))
 	for _, r := range roles {
 		allowed[strings.ToLower(r)] = struct{}{}
 	}
-
 	return func(c *fiber.Ctx) error {
 		role, _ := c.Locals(constants.LocalUserRole).(string)
 		if _, ok := allowed[strings.ToLower(role)]; !ok {
@@ -132,6 +173,63 @@ func RequireRole(roles ...string) fiber.Handler {
 	}
 }
 
-func isExpiredError(err error) bool {
-	return strings.Contains(err.Error(), "token is expired")
+// ──────────────────────────────────────────────
+// Key function builders per algorithm
+// ──────────────────────────────────────────────
+
+func buildKeyFunc(cfg *config.Config) (jwt.Keyfunc, []string, error) {
+	switch cfg.JWTAlgorithm {
+	case "RS256":
+		key, err := parseRSAPublicKey(cfg.JWTPublicKeyPEM)
+		if err != nil {
+			return nil, nil, fmt.Errorf("RS256 public key: %w", err)
+		}
+		return func(t *jwt.Token) (interface{}, error) { return key, nil },
+			[]string{"RS256"}, nil
+
+	case "ES256":
+		key, err := parseECPublicKey(cfg.JWTPublicKeyPEM)
+		if err != nil {
+			return nil, nil, fmt.Errorf("ES256 public key: %w", err)
+		}
+		return func(t *jwt.Token) (interface{}, error) { return key, nil },
+			[]string{"ES256"}, nil
+
+	default: // HS256
+		signingKey := []byte(cfg.JWTSecret)
+		return func(t *jwt.Token) (interface{}, error) { return signingKey, nil },
+			[]string{"HS256"}, nil
+	}
+}
+
+func parseRSAPublicKey(pemStr string) (*rsa.PublicKey, error) {
+	block, _ := pem.Decode([]byte(pemStr))
+	if block == nil {
+		return nil, errors.New("failed to decode PEM block")
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse PKIX public key: %w", err)
+	}
+	rsaKey, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		return nil, errors.New("PEM is not an RSA public key")
+	}
+	return rsaKey, nil
+}
+
+func parseECPublicKey(pemStr string) (*ecdsa.PublicKey, error) {
+	block, _ := pem.Decode([]byte(pemStr))
+	if block == nil {
+		return nil, errors.New("failed to decode PEM block")
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse PKIX public key: %w", err)
+	}
+	ecKey, ok := pub.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, errors.New("PEM is not an EC public key")
+	}
+	return ecKey, nil
 }

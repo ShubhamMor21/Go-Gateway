@@ -10,24 +10,40 @@ import (
 	"github.com/ShubhamMor21/go-gateway/internal/middleware"
 )
 
-// Register attaches all routes and middleware to the Fiber app.
+// Register attaches all routes. Global middleware (IP blocklist, rate limiter)
+// is applied in main.go before this function runs — only auth-scoped middleware
+// lives here.
 func Register(
 	app *fiber.App,
 	cfg *config.Config,
 	cacheClient *cache.Client,
 	grpcClient *grpcclient.Client,
 ) {
-	// Public — no auth required (used by load balancers)
+	// ── Public ───────────────────────────────────────────────────────
 	app.Get("/health", handlers.Health(cacheClient, grpcClient))
 
-	// Authenticated API group
+	// ── Authenticated API ─────────────────────────────────────────────
+	// Rate limiting is applied globally (before auth) so unauthenticated
+	// requests are throttled too — preventing brute-force on the auth endpoint.
 	api := app.Group("/api/v1",
-		middleware.Auth(cfg),
-		middleware.RateLimiter(cfg, cacheClient.RDB()),
+		middleware.Auth(cfg, cacheClient),
 	)
 
+	// Logout — must be authenticated; revokes the current token
+	api.Post("/auth/logout", handlers.Logout(cacheClient))
+
+	// User profile — [CRITICAL] ownership check inside the handler:
+	// regular users can only fetch their own profile; admin role can fetch any.
 	api.Get("/users/:id", handlers.GetUser(cacheClient, grpcClient, cfg))
 
-	// Role-gated example (uncomment when admin routes are added):
-	// admin := api.Group("/admin", middleware.RequireRole("admin"))
+	// ── [MEDIUM] Admin routes — role-gated ───────────────────────────
+	// RequireRole("admin") rejects any token whose role claim != "admin".
+	admin := api.Group("/admin", middleware.RequireRole("admin"))
+	admin.Get("/status", func(c *fiber.Ctx) error {
+		// Placeholder — wire real admin handlers here.
+		return c.JSON(fiber.Map{
+			"status":  "ok",
+			"message": "admin access confirmed",
+		})
+	})
 }

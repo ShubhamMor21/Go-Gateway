@@ -19,22 +19,21 @@ import (
 	"github.com/ShubhamMor21/go-gateway/internal/response"
 )
 
-// userIDPattern restricts path parameters to alphanumeric + hyphens (UUID-like).
-// Rejects path traversal ("../"), null bytes, special chars that could poison
-// Redis keys or be interpreted downstream.
 var userIDPattern = regexp.MustCompile(`^[a-zA-Z0-9\-]{1,` + fmt.Sprintf("%d", constants.UserIDMaxLength) + `}$`)
 
-// GetUser handles GET /users/:id.
-// Flow:  cache hit → return early.
+// GetUser handles GET /api/v1/users/:id
 //
-//	cache miss → gRPC call → cache result → return.
-//
-// Security: the :id path param is validated before being used as a Redis cache key.
+// [CRITICAL] Ownership check:
+//   A regular user may only fetch their own profile.
+//   An admin (role == "admin") may fetch any profile.
+//   Without this check, any authenticated user could enumerate all user data
+//   by guessing IDs — a classic Broken Object Level Authorization (OWASP API1).
 func GetUser(cacheClient *cache.Client, grpcClient *grpcclient.Client, cfg *config.Config) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		log := logger.FromContext(c.Locals(constants.LocalLogger))
 		requestID, _ := c.Locals(constants.LocalRequestID).(string)
 		callerUserID, _ := c.Locals(constants.LocalUserID).(string)
+		callerRole, _ := c.Locals(constants.LocalUserRole).(string)
 
 		targetUserID := c.Params("id")
 		if targetUserID == "" || !userIDPattern.MatchString(targetUserID) {
@@ -42,6 +41,22 @@ func GetUser(cacheClient *cache.Client, grpcClient *grpcclient.Client, cfg *conf
 				fiber.StatusBadRequest,
 				constants.MsgBadRequest,
 				constants.ErrCodeBadRequest,
+			)
+		}
+
+		// ── [CRITICAL] Ownership / RBAC gate ─────────────────────────
+		// A user may only read their own record. Admins bypass this check.
+		// This prevents horizontal privilege escalation: user A reading user B's data.
+		if callerUserID != targetUserID && callerRole != "admin" {
+			log.Warn("ownership violation attempt",
+				zap.String(constants.LocalRequestID, requestID),
+				zap.String("caller_id", callerUserID),
+				zap.String("target_id", targetUserID),
+			)
+			return response.Error(c,
+				fiber.StatusForbidden,
+				constants.MsgForbiddenOwnership,
+				constants.ErrCodeForbiddenOwnership,
 			)
 		}
 
@@ -79,7 +94,6 @@ func GetUser(cacheClient *cache.Client, grpcClient *grpcclient.Client, cfg *conf
 			)
 		}
 
-		// ── Populate cache (best-effort) ──────────────────────────────
 		_ = cacheClient.Set(c.UserContext(), cacheKey, user, time.Duration(cfg.CacheTTL))
 
 		return response.Success(c, fiber.StatusOK, user)
