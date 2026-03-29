@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package user;
+
+option go_package = "github.com/ShubhamMor21/go-gateway/pkg/proto/user";
+
+// UserService is the downstream identity service called by the gateway.
+service UserService {
+  rpc GetUser(GetUserRequest) returns (GetUserResponse);
+}
+
+message GetUserRequest {
+  string user_id    = 1;
+  string request_id = 2; // gateway propagates X-Request-ID for end-to-end tracing
+}
+
+message GetUserResponse {
+  string user_id = 1;
+  string name    = 2;
+  string email   = 3;
+  string role    = 4;
+}
