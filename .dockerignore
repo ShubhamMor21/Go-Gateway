@@ -1,0 +1,29 @@
+# Version control & CI (not needed in build context)
+.git
+.github
+.gitignore
+
+# Secrets — never send to the Docker daemon
+.env
+.env.*
+!.env.example
+
+# Documentation
+README.md
+*.md
+
+# IDE / OS
+.idea
+.vscode
+.DS_Store
+*.swp
+
+# Go artifacts & tests (binary is built from sources; tests not compiled into image)
+**/coverage.out
+**/*_test.go
+*.test
+*.out
+bin/
+dist/
+build/
+tmp/

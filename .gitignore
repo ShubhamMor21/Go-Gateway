@@ -1,0 +1,51 @@
+# ── Secrets & local env (never commit) ─────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ── Go build / test artifacts ────────────────────────────────
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+coverage.html
+profile
+cpu.prof
+mem.prof
+/vendor/
+
+# Output directories
+/bin/
+/dist/
+/build/
+/tmp/
+
+# Go workspace (if used)
+go.work
+go.work.sum
+
+# ── IDE & editors ────────────────────────────────────────────
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Logs & debug ─────────────────────────────────────────────
+*.log
+debug
+
+# ── Docker / local overrides ─────────────────────────────────
+docker-compose.override.yml
+.env.docker
